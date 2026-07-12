@@ -1,145 +1,111 @@
+'use strict';
 const fastify = require('fastify')({ logger: false });
-const axios = require('axios');
-const xml2js = require('xml2js');
-const path = require('path');
+const axios   = require('axios');
+const xml2js  = require('xml2js');
+const path    = require('path');
+const zlib    = require('zlib');
 
-// Registrace CORS a statických souborů
-fastify.register(require('@fastify/cors'), { origin: "*" });
+fastify.register(require('@fastify/cors'), { origin: '*' });
 fastify.register(require('@fastify/static'), {
-    root: path.join(__dirname, ''), 
-    prefix: '/', 
+    root: path.join(__dirname, ''),
+    prefix: '/',
 });
 
+// ── EPG ───────────────────────────────────
+// Nový zdroj EPG (gzipovaný XMLTV), párovaný s playlist.m3u (url-tvg)
+const EPG_URL = 'https://raw.githubusercontent.com/kozmali/sk-cz-epg/refs/heads/main/epg.xml.gz';
 let cachedEpg = [];
 
-// Funkce pro aktualizaci EPG
 async function updateEpg() {
     try {
-        console.log('⏳ Stahuji EPG data...');
-        const response = await axios.get('http://94.241.90.115:8889/epg');
-        const parser = new xml2js.Parser();
-        const result = await parser.parseStringPromise(response.data);
-        
-        if (result.tv && result.tv.programme) {
+        console.log('⏳ Stahuji EPG...');
+        const res = await axios.get(EPG_URL, {
+            timeout: 60000,
+            responseType: 'arraybuffer',
+        });
+        const xml = zlib.gunzipSync(res.data);
+        const result = await new xml2js.Parser().parseStringPromise(xml);
+        if (result.tv?.programme) {
             cachedEpg = result.tv.programme;
-            const formatDate = (s) => `${s.substring(0,4)}-${s.substring(4,6)}-${s.substring(6,8)}`;
-            const rawDays = cachedEpg.map(p => p.$.start.substring(0, 8));
-            const uniqueDays = [...new Set(rawDays)].sort();
-            
-            console.log(`✅ EPG aktualizováno (${cachedEpg.length} pořadů)`);
-            uniqueDays.forEach(day => console.log(`   👉 ${formatDate(day)}`));
+            console.log(`✅ EPG: ${cachedEpg.length} pořadů`);
         }
     } catch (err) {
-        console.error('❌ Chyba EPG:', err.message);
+        console.error('❌ EPG:', err.message);
     }
 }
-
-// Interval pro EPG (každou hodinu)
-setInterval(updateEpg, 60 * 60 * 1000); 
 updateEpg();
+setInterval(updateEpg, 60 * 60 * 1000);
 
-// Endpoint pro získání EPG dat
+// ── EPG ENDPOINT ──────────────────────────
 fastify.get('/epg-data', async (request, reply) => {
-    const queryId = decodeURIComponent(request.query.id);
-    const isFull = request.query.full === 'true';
-    const queryDate = request.query.date; 
-    
-    if (!queryId || cachedEpg.length === 0) {
-        return isFull ? [] : { title: "Program není k dispozici" };
-    }
+    const queryId   = decodeURIComponent(request.query.id || '');
+    const isFull    = request.query.full === 'true';
+    const queryDate = request.query.date;
 
-    const channelProgrammes = cachedEpg.filter(p => p.$.channel === queryId);
+    if (!queryId || !cachedEpg.length)
+        return isFull ? [] : { title: 'Program není k dispozici' };
 
-    const formatProg = (p) => ({
-        title: (typeof p.title[0] === 'object') ? p.title[0]._ : p.title[0],
-        desc: p.desc ? ((typeof p.desc[0] === 'object') ? p.desc[0]._ : p.desc[0]) : "",
-        start: p.$.start,
-        stop: p.$.stop,
-        image: (p.icon && p.icon[0].$) ? p.icon[0].$.src : ""        
+    const progs = cachedEpg.filter(p => p.$.channel === queryId);
+    const fmt = p => ({
+        title: typeof p.title[0] === 'object' ? p.title[0]._ : p.title[0],
+        desc:  p.desc ? (typeof p.desc[0] === 'object' ? p.desc[0]._ : p.desc[0]) : '',
+        start: p.$.start, stop: p.$.stop,
+        image: p.icon?.[0]?.$?.src || '',
     });
 
     if (isFull) {
-        if (queryDate) {
-            const filtered = channelProgrammes.filter(p => {
-                const startsToday = p.$.start.startsWith(queryDate);
-                const stopsToday = p.$.stop.startsWith(queryDate);
-                return startsToday || stopsToday;
-            });
-            return filtered.map(formatProg);
-        }
-        return channelProgrammes.map(formatProg);
+        const list = queryDate
+            ? progs.filter(p => p.$.start.startsWith(queryDate) || p.$.stop.startsWith(queryDate))
+            : progs;
+        return list.map(fmt);
     }
 
-    const now = new Date();
-    const czTime = new Intl.DateTimeFormat('cs-CZ', {
+    const czParts = new Intl.DateTimeFormat('cs-CZ', {
         timeZone: 'Europe/Prague',
-        year: 'numeric', month: '2-digit', day: '2-digit',
-        hour: '2-digit', minute: '2-digit', second: '2-digit',
-        hour12: false
-    }).formatToParts(now);
-
+        year:'numeric', month:'2-digit', day:'2-digit',
+        hour:'2-digit', minute:'2-digit', second:'2-digit', hour12: false,
+    }).formatToParts(new Date());
     const t = {};
-    czTime.forEach(({type, value}) => t[type] = value);
+    czParts.forEach(({ type, value }) => t[type] = value);
     const nowStr = `${t.year}${t.month}${t.day}${t.hour}${t.minute}${t.second}`;
 
-    const current = channelProgrammes.find(p => {
-        const start = p.$.start.split(' ')[0];
-        const stop = p.$.stop.split(' ')[0];
-        return nowStr >= start && nowStr <= stop;
+    reply.header('Cache-Control', 'no-store');
+    const current = progs.find(p => {
+        const s = p.$.start.split(' ')[0], e = p.$.stop.split(' ')[0];
+        return nowStr >= s && nowStr <= e;
     });
+    if (current) return fmt(current);
+    const upcoming = progs.find(p => p.$.start.split(' ')[0] > nowStr);
+    return upcoming ? fmt(upcoming) : { title: 'Program není k dispozici' };
+});
 
-    reply.header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
-
-    if (current) {
-        return formatProg(current);
-    } else {
-        const upcoming = channelProgrammes.find(p => p.$.start.split(' ')[0] > nowStr);
-        return upcoming ? formatProg(upcoming) : { title: "Program není k dispozici" };
+// ── PLAYLIST ───────────────────────────────
+// Kanály teď vedou přímo na své vlastní zdrojové servery (viz playlist.m3u),
+// žádný centrální upstream už není potřeba — soubor se jen servíruje z disku.
+fastify.get('/get-playlist', async (request, reply) => {
+    try {
+        const fs = require('fs');
+        const local = fs.readFileSync(path.join(__dirname, 'playlist.m3u'), 'utf-8');
+        reply.header('Content-Type', 'application/x-mpegurl; charset=utf-8');
+        reply.header('Cache-Control', 'no-store');
+        return reply.send(local);
+    } catch (e) {
+        return reply.code(502).send('Playlist nedostupný');
     }
 });
 
-// --- PROXY SEKCE SE STABILIZACÍ PRO IOS ---
-
-// Proxy pro /oneplay
-fastify.register(require('@fastify/http-proxy'), {
-    upstream: 'http://94.241.90.115:8889',
-    prefix: '/oneplay',
-    replyOptions: { 
-        rewriteRequestHeaders: (req, headers) => ({ 
-            ...headers, 
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0',
-            'host': '94.241.90.115:8889',
-            'connection': 'keep-alive' 
-        }),
-        getUpstream: (req, base) => base,
-        undici: {
-            bodyTimeout: 0,    // Nekonečný timeout pro data (klíčové pro iOS)
-            headersTimeout: 0, 
-            keepAliveTimeout: 60000 
-        }
-    }
+// ── ROUTES ───────────────────────────────────
+// Serve oneprime.html at root (/) — no redirect, URL stays clean
+fastify.get('/', async (request, reply) => {
+    return reply.sendFile('oneprime.html');
 });
 
-// Proxy pro /play
-fastify.register(require('@fastify/http-proxy'), {
-    upstream: 'http://94.241.90.115:8889',
-    prefix: '/play',
-    replyOptions: { 
-        rewriteRequestHeaders: (req, headers) => ({ 
-            ...headers, 
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:142.0) Gecko/20100101 Firefox/142.0',
-            'host': '94.241.90.115:8889',
-            'connection': 'keep-alive'
-        }),
-        undici: {
-            bodyTimeout: 0,
-            headersTimeout: 0,
-            keepAliveTimeout: 60000
-        }
-    }
+// Also serve at /oneprime and /oneprime.html
+fastify.get('/oneprime', async (request, reply) => {
+    return reply.sendFile('oneprime.html');
 });
 
-// Start serveru
+// ── START ─────────────────────────────────
 const start = async () => {
     try {
         const port = process.env.PORT || 3000;
